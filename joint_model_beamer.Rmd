@@ -1,0 +1,400 @@
+---
+title: "Joint Survival and QOL Modeling of PARTNER Data"
+author: "Jacob Spertus"
+date: ""
+header-includes:
+  - \usepackage{amsmath}
+output: 
+  beamer_presentation
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(dev = 'png', echo = FALSE, warning = FALSE, message = FALSE, caption = FALSE)
+options(scipen = 20)
+
+library(survival)
+library(survminer)
+library(reshape2)
+library(purrr)
+library(tidyr)
+library(dplyr)
+library(mice)
+library(broom)
+library(rstanarm)
+library(lubridate)
+library(magrittr)
+library(rstan)
+library(ggplot2)
+source("~/Dropbox/FDA/R/Data/read_partners_data.R")
+setwd("~/Dropbox/FDA/R/Joint Model/")
+```
+
+```{r configure data, include = TRUE}
+#function to transform QOL to be unbounded
+to_norm <- function(qol){
+  qol[qol >= .99] <- .99
+  qol[qol <= .01] <- .01
+  qnorm(qol)
+}
+  
+#function to generate a single imputation of missing longitudinal data using PMM (this should be improved in later iterations)
+impute <- function(data){
+  complete(mice(data, m = 1, method = 'pmm'))
+}
+
+#these variables must be characters for proper joinings
+data_list$patientdatelist$Subject %<>% as.character()
+data_list$baseline$Subject %<>% as.character()
+data_list$qol_wide_cat$Subject %<>% as.character()
+
+
+####################### QOL data ###################
+qol_long <- data_list %>%
+  pluck("qol_long") %>%
+  select(Subject, startdate_ITT, FU_MDY_DT, FolderName, trialarm, time, KCCQOS) %>%
+  mutate(VisitNum = as.numeric(recode(FolderName, "Baseline Visit" = 0, "30 Day Follow Up" = 1, "6 Month Follow Up" = 2, "1 Year Follow Up" = 3))) %>%
+  mutate(FU_MDY_DT = mdy(format(FU_MDY_DT, "%D"))) 
+
+#there are 21 missing KCCQOS scores
+#complete case analysis here
+#also do not keep baseline scores (differences in treatment are reflected in intercept)
+qol_data <- qol_long %>% 
+  dplyr::select(Subject, time, trialarm, KCCQOS) %>%
+  #filter(time != 0) %>%
+  mutate(years = time / 12) %>%
+  mutate(KCCQOS = KCCQOS / 100) %>% #rescaled KCCQOS to [0,1] 
+  mutate(NormalKCCQOS = to_norm(KCCQOS)) %>%
+  mutate(time = time  / diff(range(time))) %>%
+  mutate(treat_group = ifelse(trialarm == "TEST", "Treatment", "Control")) %>%
+  na.omit() %>%
+  #impute() %>%
+  as_tibble() %>%
+  arrange(Subject, years)
+
+############ survival data ##############
+#currently, subjects with NO QOL data are not included. Is this OK?
+survival_data <- data_list[c('patientdatelist','baseline','qol_wide_cat')] %>%
+  reduce(left_join, by = "Subject") %>%
+  dplyr::select(Subject, DaysForITTanalysis, DeathDate, TrialArm, female, racegroup, age, bmi, height, weight, nyha, EF) %>%
+  mutate(gender = ifelse(female == 1, "female", "male")) %>%
+  mutate(TrialArm = ifelse(TrialArm == "TEST", 1, 0)) %>% 
+  mutate(YearsForITT = (DaysForITTanalysis + 1) / 365) %>%
+  mutate(Censored = is.na(DeathDate)) %>%
+  select(YearsForITT, Censored, Subject, TrialArm) %>%
+  filter(Subject %in% qol_data$Subject) %>% #get rid of any subjects w/o QOL data 
+  arrange(Subject)
+  
+#time is centered
+data_list_stan <- list(
+  N = nrow(qol_data),
+  I = n_distinct(survival_data$Subject),
+  KCCQ = qol_data$NormalKCCQOS,
+  Timepoint = qol_data$time,
+  Treatment = survival_data$TrialArm,
+  Subjects = as.numeric(as.factor(qol_data$Subject)),
+  Y = survival_data$YearsForITT,
+  Cen = as.numeric(survival_data$Censored)
+)
+```
+
+##Sections
+
+- Background
+- Notation and Model
+- MCMC Fitting
+- Model Checking 
+- Inference
+
+
+#Why Do Joint Modeling?
+
+- Ibrahim, Chu, and Chen 2010 (Oncology):
+
+\begin{enumerate}
+\item More efficient treatment effect on survival estimates
+\item More efficient effect on longitudinal QOL estimates
+\item Reduced bias on "overall" treatment effect (survival and longitudinal)
+\item \textcolor{red}{Incorporating survival information into longitudinal estimates accounts for informative missing data due to death (Gould et al, 2015)}
+\end{enumerate}
+
+These qualities mean that an RCT has more power, so it can rely on a smaller sample size to achieve a given level of precision.
+
+#Past Focuses
+- Much past research has focused on reducing bias and variance of the estimated effect on survival (Gould et al, 2015) ($\beta_T$)
+- A few researchers have focused more on longitudinal component (McCardle et al, 2005) ($\gamma_0$ and $\gamma_1$)
+- Interest has recently surrounded magnitude of association between longitudinal and survival components ($\theta_{0i}$, $\theta_{1i}$, $\beta_\theta$)
+- Much development has been in oncology and AIDS research, with past joint modeling practices and guidelines reflecting idiosyncracies of those fields.
+- We would like to develop methods specifically with cardiological applications in mind.
+
+
+
+#A QOL and Survival Model
+
+$i \in \{1,...,I\}$ indexes subjects; $j \in \{1,..,J\}$ indexes time points. $Y_{ij}$ gives the KCCQOS score at time $j$ for subject $i$; $T_i$ is treatment; $S_i$ is survival time and is possibly right censored. 
+
+\begin{align}
+  Y_{ij} &= \mu_{\theta_0} + \theta_{0i} + \mu_{\theta_1} j + \theta_{1i} j + \gamma_0 T_i + \gamma_1 T_i j + \epsilon_{ij}\\
+  S_i &\sim \mbox{Weibull}\{\alpha, \exp(-(\beta_0 + \beta_T \cdot T_i + \beta_{\theta_0} \cdot \theta_{0i} + \beta_{\theta_1} \cdot \theta_{1i}))\}
+\end{align}
+\footnotesize{
+\begin{align}
+  \epsilon_{ij} &\sim \mathcal{N}(0, \sigma^2)\\
+  \theta_{0i} &\sim \mathcal{N}(0, \sigma_{\theta_0}^2)\\
+  \theta_{1i} &\sim \mathcal{N}(0, \sigma_{\theta_1}^2)\\
+  [\mu_{\theta_0}, \mu_{\theta_1}] &\sim \mathcal{N}(0,1)\\
+  [\gamma_0, \gamma_1] &\sim \mathcal{N}(0,1)\\
+  [\beta_{\theta_0}, \beta_{\theta_1}] &\sim \mathcal{N}(0,1)\\
+  [\beta_T, \beta_0] &\sim \mathcal{N}(0,10)\\
+  [\sigma, \sigma_{\theta_0}, \sigma_{\theta_1}] &\sim t_3^+(0,1)\\
+  \alpha &\sim \mathcal{N}^+(0,10)
+\end{align}
+}
+
+```{r fit model, results = "hide"}
+#separate_model <- stan_model("separate_model.stan")
+#separate_fit <- sampling(separate_model, data = data_list_stan, chains = 4, cores = 2, iter = 1000, control = list(adapt_delta = .99, max_treedepth = 14))
+#save(separate_fit, file = "separate_fit")
+load("separate_fit")
+#joint_model <- stan_model("joint_model_randomslope.stan")
+#joint_fit <- sampling(joint_model, data = data_list_stan, chains = 4, cores = 2, iter = 1000, control = list(adapt_delta = .99, max_treedepth = 14))
+#save(joint_fit, file = "re_joint_fit_randomslope")
+load("re_joint_fit_randomslope")
+```
+
+
+#PARTNER Data
+
+- Transcatheter aortic valve replacement (TAVR) in patients not eligible for surgical valve replacement
+- $n_1 = 179$ were randomized to TAVR and $n_0 = 179$ were randomized to standard therapy
+- Quality-of-life (QOL) data collected using Kansas City Cardiomyopathy Questionnaire (KCCQ) at 0, 1, 6, and 12 months
+- Survival data was also recorded, and all subjects were followed for at least 1-year after implantation
+- Initial analyses showed substantially improved QOL and reduction in mortality due to treatment (Reynolds et al 2011, Leon et al 2010). 
+- Hazard ratio: 0.55 (95\% CI, 0.40-0.74)
+- 6-month KCCQ summary difference: 21 points (95\% CI, 15-27)
+
+
+```{r model diagnostics, include = FALSE}
+stan_rhat(joint_fit, bins = 30)
+```
+
+
+
+
+```{r get model parameters}
+pars <- tidyMCMC(joint_fit, conf.int = TRUE, conf.level = .95) %>% as_tibble()
+fitted_subjects_frame <- pars %>%
+  filter(grepl("bounded_predictor", term)) %>%
+  mutate(subjects = data_list_stan$Subjects, time = data_list_stan$Timepoint, observed = pnorm(data_list_stan$KCCQ), treatment = qol_data$trialarm) 
+```
+
+
+#Observed Trajectories 
+
+The trajectories observed in the data. Monthly averages are overlayed in orange.
+
+```{r observed trajectories}
+time_means <- fitted_subjects_frame %>%
+  group_by(time, treatment) %>%
+  summarize(mean_observed = mean(observed), se_observed = sqrt(var(estimate) / n())) %>%
+  ungroup() %>%
+  mutate(lower = mean_observed - 1.96*se_observed, upper = mean_observed + 1.96*se_observed)
+  
+plot_observed_trajectories <- ggplot(fitted_subjects_frame, aes(x = time, y = observed)) +
+  geom_line(aes(group = subjects)) +
+  geom_point(aes(group = subjects)) +
+  geom_pointrange(data = time_means, aes(x = time, y = mean_observed, ymin = lower, ymax = upper), size = 1.1, colour = "darkorange3") +
+  geom_line(data = time_means, aes(x = time, y = mean_observed), size = 1.0, colour = "darkorange3") +
+  facet_grid(~ treatment) +
+  labs(title = "Observed Trajectories", x = "Months") +
+  ylim(0,1)
+plot_observed_trajectories
+```
+
+
+#Linear Predictors
+Predicted trajectories for individuals estimated from the model.
+```{r linear predictor}
+plot_linear_predictors <- ggplot(fitted_subjects_frame, aes(x = time, y = estimate, group = subjects)) +
+  geom_line() +
+  geom_point() +
+  #ylim(0,1) +
+  facet_grid(~ treatment) +
+  labs(title = "Fitted Trajectories", x = "Months") +
+  ylim(0,1)
+plot_linear_predictors
+```
+
+
+#Individual Trajectories
+Predicted trajectories overlayed with observed trajectories for 16 individual subjects.
+
+```{r individual subject trajectories}
+reduced_fitted_subjects_frame <- fitted_subjects_frame %>% 
+  filter(subjects %in% 1:16) %>%
+  gather(key = "qol_type", value = "value", estimate, observed) %>%
+  unite(subject_treatment, subjects, treatment, sep = ", ") %>%
+  mutate(subject_treatment = factor(subject_treatment, levels = unique(subject_treatment)))
+  
+
+plot_trajectories_subjects <- ggplot(reduced_fitted_subjects_frame, aes(x = time, y = value, color = qol_type)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ subject_treatment) +
+  labs(title = "Overplotted Subject Trajectories", x = "Months") +
+  theme_grey() +
+  ylim(0,1)
+
+plot_trajectories_subjects
+```
+
+#Population Level QOL Curves
+The dotted lines and points with error bars are average observed KCCQOS values with 95\% credible intervals. Solid lines are model estimates with 95\% credible intervals. 
+
+```{r population level QOL curves}
+#actual curves
+observed_population_curves <- qol_data %>%
+  group_by(time, trialarm) %>%
+  summarize(mean_KCCQOS = mean(KCCQOS, na.rm = T), se_KCCQOS = sqrt(var(KCCQOS, na.rm = T) / n())) %>%
+  ungroup() %>%
+  mutate(lower_KCCQOS = mean_KCCQOS - 1.96*se_KCCQOS, upper_KCCQOS = mean_KCCQOS + 1.96*se_KCCQOS) %>%
+  mutate(treat_group = ifelse(trialarm ==  "TEST", "Treatment", "Control"))
+#fitted curves from model
+time_grid <- seq(0,1,by=.1)
+qol_draws <- extract(joint_fit, pars = c("mu_theta_1","mu_theta_0", "gamma_0", "gamma_1"))
+draws_mu_theta_0 <- qol_draws$mu_theta_0
+draws_mu_theta_1 <- qol_draws$mu_theta_1
+draws_gamma_0 <- qol_draws$gamma_0
+draws_gamma_1 <- qol_draws$gamma_1
+curve_control <- pnorm(as.numeric(draws_mu_theta_0) + as.matrix(draws_mu_theta_1) %*% t(time_grid)) %>% 
+  melt(varnames = c("draws","time")) %>%
+  group_by(time) %>%
+  summarize(mean = mean(value), lower = quantile(value, .025), upper = quantile(value, .975)) %>%
+  mutate(treat_group = "Control", time = time_grid)
+curve_treatment <- pnorm(as.numeric(draws_mu_theta_0) + as.matrix(draws_mu_theta_1) %*% t(time_grid) + as.numeric(draws_gamma_0) + as.matrix(draws_gamma_1) %*% t(time_grid)) %>% 
+  melt(varnames = c("draws","time")) %>%
+  group_by(time) %>%
+  summarize(mean = mean(value), lower = quantile(value, .025), upper = quantile(value, .975)) %>%
+  mutate(treat_group = "Treatment", time = time_grid)
+fitted_population_qol_curves <- bind_rows(curve_treatment, curve_control)
+#plot population level qol curves
+plot_fitted_population_qol_curves <- ggplot(fitted_population_qol_curves, aes(x = time, y = mean)) +
+  geom_pointrange(data = observed_population_curves, aes(x = time, y = mean_KCCQOS, ymin = lower_KCCQOS, ymax = upper_KCCQOS, color = treat_group)) +
+  geom_line(data = observed_population_curves, aes(x = time, y = mean_KCCQOS, color = treat_group), linetype = 'dashed') +
+  geom_ribbon(aes(fill = treat_group, ymax = upper, ymin = lower), alpha = .2) +
+  geom_line(aes(color = treat_group)) +
+  ylim(0,1) +
+  xlab("Time") +
+  ylab("Fitted Population Level KCCQOS")
+plot_fitted_population_qol_curves
+```
+
+
+#Survival Curves
+
+Observed Kaplan-Meier and estimated Weibull survival curves, for each treatment group.
+
+```{r survival curves}
+#given a scale, shape, and grid of values, draw the weibull curve
+compute_weibull_curve <- function(x, shape, scale){
+  curve <- exp(-(x/scale)^shape)
+  curve
+}
+survival_grid <- seq(0,2.5,by=.01)
+alpha <- pars %>% filter(term == "alpha")
+beta_t <- pars %>% filter(term == "beta_t")
+beta_0 <- pars %>% filter(term == "beta_0")
+curve_treatment <- compute_weibull_curve(x = survival_grid, shape = alpha$estimate, scale = exp(-(beta_0$estimate + beta_t$estimate) / alpha$estimate))
+curve_control <- compute_weibull_curve(x = survival_grid, shape = alpha$estimate, scale = exp(-(beta_0$estimate) / alpha$estimate))
+#fitted curves from model
+fitted_survival_data <- data.frame(
+  fitted = 100*c(curve_treatment, curve_control), 
+  treat_group = c(rep("Treatment",length(survival_grid)), rep("Control", length(survival_grid))),
+  time = rep(survival_grid,2)
+  )
+#survival data observed in sample (for Kaplan-Meier curves)
+observed_survival_data <- data.frame(Y = data_list_stan$Y, Cen = 1-data_list_stan$Cen, Treatment = ifelse(data_list_stan$Treatment == 1, "Treatment", "Control"))
+#km curves
+surv_object <- Surv(time = data_list_stan$Y, event = 1-data_list_stan$Cen)
+km_treatments <- survfit(surv_object ~ Treatment, data = observed_survival_data)
+plot_km_treatments <- ggsurvplot(km_treatments, fun = 'pct', conf.int = T) +
+  geom_line(data = fitted_survival_data, aes(x = time, y = fitted, group = treat_group), linetype = "dashed")
+plot_km_treatments
+```
+
+
+<!-- #Theta Variances -->
+<!-- As a final sanity check, her are the standard error of the thetas for subjects with 1, 2, 3, and 4 QOL observations. We would expect subjects with more observations to have more certain thetas (i.e. with lower standard error), and indeed we do see this. -->
+
+```{r random effects and subject data, include = FALSE}
+subject_observations <- qol_data %>%
+  group_by(Subject) %>%
+  summarize(observations = n(), treatment = first(trialarm)) 
+theta_0 <- pars %>%
+  filter(grepl("theta_0\\[", term)) %>%
+  mutate(term = gsub("\\[.*", "", term)) %>%
+  bind_cols(subject_observations)
+theta_1 <- pars %>%
+  filter(grepl("theta_1\\[", term)) %>%
+  mutate(term = gsub("\\[.*", "", term)) %>%
+  bind_cols(subject_observations)
+thetas <- bind_rows(theta_0, theta_1)
+
+
+hist_theta_se <- ggplot(thetas, aes(std.error)) +
+  geom_histogram(color = "white", fill = "black", bins = 25) +
+  facet_grid(observations ~ term)
+hist_theta_se
+```
+
+##Inference 
+
+#Forest Plots for Key Parameters
+Treatment parameters $\gamma_0$, $\gamma_1$ and $\beta_T$ are of key interest.
+
+```{r plot parameters}
+mu_theta_0 <- pars %>% filter(term == "mu_theta_0")
+mu_theta_1 <- pars %>% filter(term == "mu_theta_1")
+gamma_0 <- pars %>% filter(term == "gamma_0")
+gamma_1 <- pars %>% filter(term == "gamma_1")
+beta_t <- pars %>% filter(term == "beta_t")
+beta_theta_0 <- pars %>% filter(term == "beta_theta_0")
+beta_theta_1 <- pars %>% filter(term == "beta_theta_1")
+plot(joint_fit, pars = c("gamma_0","gamma_1","beta_t","beta_theta_0","beta_theta_1"))
+```
+
+
+#Key Parameters
+
+
+The posterior mean for $\gamma_0$ is `r round(gamma_0$estimate,2)` (95\% CI: `r round(gamma_0$conf.low,2)`, `r round(gamma_0$conf.high,2)`). Under the model, subjects in the treatment group have an average 6-month QOL of `r round(pnorm(mu_theta_0$estimate + gamma_0$estimate + mu_theta_1$estimate*.5 + gamma_1$estimate*.5),2)` compared to `r round(pnorm(mu_theta_0$estimate + mu_theta_1$estimate*.5), 2)` in the control group, a difference of `r round(pnorm(mu_theta_0$estimate + gamma_0$estimate + gamma_1$estimate*.5),2) - round(pnorm(mu_theta_0$estimate + mu_theta_1$estimate*.5), 2)`. 
+
+
+
+On the hazard ratio scale, the posterior mean for $\beta_T$ is `r round(exp(beta_t$estimate),2)` (95\% CI: `r round(exp(beta_t$conf.low),2)`, `r round(exp(beta_t$conf.high),2)`). The posterior mean for $\beta_{\theta_0}$ is `r round(exp(beta_theta_0$estimate),2)` (95\% CI: `r round(exp(beta_theta_0$conf.low),2)`, `r round(exp(beta_theta_0$conf.high),2)`), and for $\beta_{\theta_1}$ is `r round(exp(beta_theta_1$estimate),2)` (95\% CI: `r round(exp(beta_theta_1$conf.low),2)`, `r round(exp(beta_theta_1$conf.high),2)`). Ths although the estimated hazard for $\beta_{\theta_0}$ is low, it is important to note that there is considerable uncertainty in this estimate. The estimate for $\beta_{\theta_1}$ is even more uncertain, and the credible intervals are almost completely uninformative.  
+
+#Posterior Mean Thetas
+The distributions of $\theta_0$ and $\theta_1$ appear below:
+
+```{r distribution of thetas}
+thetas <- pars %>% filter(grepl("theta_0\\[", term) | grepl("theta_1\\[", term)) %>%
+  separate(term, into = c("term","index"), sep = "\\[") %>%
+  mutate(index = as.numeric(gsub("\\]","",index)))
+theta_histogram <- ggplot(thetas, aes(estimate)) +
+  geom_histogram(color = "white", fill = "black", bins = 25) +
+  facet_grid(~ term, scales = "fixed")
+  
+theta_histogram
+```
+
+#Inferential Conclusions
+A (relatively very healthy) subject with a $\theta_{0i}$ value of 1, which puts them at a mean predicted baseline QOL of `r round(pnorm(1 + mu_theta_0$estimate), 2)` in the control group or `r round(pnorm(1 + mu_theta_0$estimate + gamma_0$estimate), 2)` in the treatment group, multiplies their hazard by `r round(exp(1 * beta_theta_0$estimate), 2)` (95\% CI: `r round(exp(1 * beta_theta_0$conf.low),2)`, `r round(exp(1* beta_theta_0$conf.high),2)`). In other words, due to their high baseline QOL, these patients have under half the risk of mortality as a patient with average QOL (with considerable uncertainty however).
+
+
+$\beta_T$ tells us how treatment impacts survival. The hazard ratio for treatment of `r round(exp(beta_t$estimate),2)` (95\% CrI: `r round(exp(beta_t$conf.low),2)`,`r round(exp(beta_t$conf.high),2)`) tells us that treatment basically halves the risk of mortality over time. In the original partner trial reported in NEJM, analysis indicated a hazard (at 1 year) of .55 (95\% CI: .40, .74).
+
+#Further Questions
+
+\begin{enumerate}
+\item R packages for fitting and inference (\texttt{rstan}, \texttt{JMBayes}, etc)
+\item Other specifications: Cox survival, joint trajectory, covariates
+\end{enumerate}
